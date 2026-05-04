@@ -1,0 +1,17 @@
+[project]
+name = "axioner-deploy"
+version = "0.1.0"
+description = "Remote AI deployment system for axioner.top"
+requires-python = ">=3.11"
+dependencies = [
+    "paramiko>=4.0,<5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
