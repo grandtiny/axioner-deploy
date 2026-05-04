@@ -1,0 +1,12 @@
+FROM node:20-alpine
+WORKDIR /app
+
+# Cache deps separately from source
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY . .
+
+# Replace {{PORT}} when copying to a real project (or keep as a build-arg)
+EXPOSE {{PORT}}
+CMD ["node", "server/index.js"]

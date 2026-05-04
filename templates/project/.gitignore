@@ -1,0 +1,23 @@
+# 依赖
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 密钥（重要：永远不进 git）
+.env
+
+# 运行时数据
+data/
+logs/
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 临时
+*.tmp

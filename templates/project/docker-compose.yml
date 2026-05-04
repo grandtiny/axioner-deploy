@@ -1,0 +1,21 @@
+# 占位符（部署时由 axioner-deploy/deploy.py 替换）：
+#   {{PROJECT_NAME}}  - 项目短名（如 bar）
+#   {{PORT}}          - 本地端口（如 3102）
+#   {{SUBDOMAIN}}     - 完整子域（如 bar.axioner.top）
+
+services:
+  app:
+    build: .
+    container_name: {{PROJECT_NAME}}-app-1
+    ports:
+      # 仅 127.0.0.1 监听；nginx 反代是唯一对外入口
+      - "127.0.0.1:{{PORT}}:{{PORT}}"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - PORT={{PORT}}
+    restart: unless-stopped
