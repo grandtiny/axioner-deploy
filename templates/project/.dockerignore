@@ -1,0 +1,22 @@
+# 应用源码外的东西不进容器
+node_modules/
+__pycache__/
+.venv/
+venv/
+
+# Git
+.git/
+.gitignore
+
+# 密钥永远不进镜像
+.env
+
+# 日志和数据由 volume 挂载，不进镜像
+*.log
+data/*.json
+logs/*.log
+
+# 文档不进镜像
+docs/
+*.md
+.claude/
