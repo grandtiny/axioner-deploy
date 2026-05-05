@@ -101,11 +101,17 @@ def _render_report(plan: DeployPlan, state: ServerState,
     lines.append(f"  拟部署:    {_c(_CYAN, plan.project_name)}")
     lines.append(f"  仓库:      {plan.repo_url}")
 
-    dns_marker = (
-        _c(_GREEN, f"✓ 解析到 {dns_to}") if dns_to == SERVER_IP else
-        _c(_RED, f"✗ 解析到 {dns_to}（应为 {SERVER_IP}）") if dns_to else
-        _c(_RED, "✗ 未解析")
-    )
+    # Lazy import to avoid widening lib surface
+    from scripts.lib.conflict_detector import _is_cloudflare_ip
+
+    if dns_to == SERVER_IP:
+        dns_marker = _c(_GREEN, f"✓ 解析到 {dns_to}")
+    elif dns_to and _is_cloudflare_ip(dns_to):
+        dns_marker = _c(_YELLOW, f"⚠ Cloudflare 代理 {dns_to}")
+    elif dns_to:
+        dns_marker = _c(_RED, f"✗ 解析到 {dns_to}（应为 {SERVER_IP}）")
+    else:
+        dns_marker = _c(_RED, "✗ 未解析")
     lines.append(f"  域名:      {plan.subdomain}    DNS: {dns_marker}")
 
     port_note = "（自动选）" if port_auto else "（你指定）"
