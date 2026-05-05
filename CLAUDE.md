@@ -10,9 +10,10 @@
 | OS | Ubuntu 24.04 LTS |
 | 资源 | 2C / 1.9 GB RAM / 1 GB swap / 20 GB 磁盘 |
 | SSH | `ssh axioner`（key auth，无密码） |
-| 已部署项目 | `paste`（端口 3101，paste.axioner.top）|
 | 反代 | Nginx 1.24 + Certbot |
 | 容器运行时 | Docker 29.4 |
+
+**已部署项目清单见 [`docs/deployments.md`](docs/deployments.md)**（每次部署/大改后更新那里，不要把项目列表散到这里）。
 
 ## 你能干什么
 
@@ -83,15 +84,51 @@ ssh axioner "certbot certificates"
 
 | 冲突 | 你应该说 |
 |------|---------|
-| DNS 未解析或解析错 | "请你去 DNS 后台为 X 加 A 记录指向 38.12.23.241。加完跟我说。" |
+| DNS 未解析或解析错（且非 Cloudflare） | "请你去 DNS 后台为 X 加 A 记录指向 38.12.23.241。加完跟我说。" |
+| DNS 解析到 Cloudflare 代理 IP（warn） | "你域名挂在 Cloudflare 橙云后面。多数情况下 certbot 仍能拿到证书。先继续？" |
 | 端口已用 | "拟用端口 3101 已被 paste 占用。建议改成 3102（preflight 会自动避开）。继续？" |
 | 目录 `/opt/X` 已存在 | "更新已有？还是新建并换名？" |
 | Nginx site 已存在 | "覆盖还是改子域？" |
 | 内存 < 200 MB | "服务器内存紧张（剩 X MB）。要不要先停一些容器再继续？" |
 | 磁盘 < 1 GB | "磁盘空间不够（剩 X GB）。建议 docker system prune 后再继续。" |
 | 私有仓库 git clone 失败 | "需要在服务器配 GitHub deploy key。指引：..." |
-| Certbot 失败 | "Certbot 输出：...。多半是 DNS 没生效，等几分钟再试。" |
+| Certbot 失败 | "Certbot 输出：...。若 DNS 在 Cloudflare 橙云，可临时改成灰云后重试。其它情况多半是 DNS 没生效，等几分钟再试。" |
 | .env 含占位符 | "请 ssh axioner 编辑 /opt/X/.env 填入真实密钥，填好回我。" |
+
+## 部署真实第三方项目时常见的事
+
+> 这一节是从首次部署 `Suxiaoqinx/Netease_url` 时实际踩坑出来的。其它 web/API 类小项目大概率撞同样的坑。
+
+### 1. 项目自带 docker-compose.yml 端口未必合规
+
+很多项目写 `ports: ["5000:5000"]`，等同 `0.0.0.0:5000:5000`。`deploy.py` 已自动处理：clone 后读它的 compose 拿端口，写一份 `docker-compose.override.yml` 强制 `127.0.0.1:<port>:<port>`。
+
+如果项目内部**硬编码了端口**（entrypoint 里写死 `--url http://127.0.0.1:5000` 之类），auto-pick 的端口没用。preflight 时给 `--port <项目实际端口>` 显式对齐。
+
+### 2. Cloudflare 代理下的 DNS
+
+子域名挂在 Cloudflare 橙云时，解析到 `104.16.*` / `172.64.*` 等 anycast IP。preflight 已识别为 warn 不 block。Certbot 通常能拿证书；失败时让用户临时把那条 A 记录改成"灰云"再重试。
+
+### 3. 上游 Dockerfile 版本不兼容
+
+如果 `docker compose build` 在 pip install 阶段报 "Could not find a version that satisfies the requirement <pkg>==<ver>"，多半是 Python 版本不够。建议让用户 fork 上游 repo，改 Dockerfile 第一行的 base image，再从他们 fork 部署。
+
+### 4. 仓库里有 sample cookie/secrets
+
+不少 README 让用户把 secrets 写到 `xxx.txt` / `.env` 里，且仓库里就 commit 了一份占位/示例。docker build 时这些会被打进镜像。**让用户在 `docker-compose.override.yml` 里挂卷**：
+
+```yaml
+services:
+  <svc>:
+    volumes:
+      - ./cookie.txt:/app/cookie.txt:ro
+```
+
+之后改宿主文件 → `docker compose restart` 立刻生效，无需 rebuild。**永远不要把真实 cookie/key push 回 fork**。
+
+### 5. /health 报 invalid 不一定真坏
+
+健康检查的"valid/invalid"判断是项目自己写的，可能要求很多字段。实际功能能不能用，要拿真实 API 试一下（比如搜索、解析）。先跑功能再调 health 实现。
 
 ## 部署熟练度（spec §3.5）
 

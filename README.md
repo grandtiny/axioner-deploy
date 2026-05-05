@@ -96,10 +96,60 @@ python scripts/deploy.py --plan-file snap.json
 ssh axioner "cd /opt/<name> && git pull && docker compose build && docker compose up -d"
 ```
 
+## 部署真实第三方项目时常见的事
+
+> 这一节是从首次部署一个真实仓库（`Suxiaoqinx/Netease_url`）时发现的踩坑总结。
+
+### 1. 项目自带的 `docker-compose.yml` 端口未必合规
+
+很多项目写 `ports: ["5000:5000"]`，等同 `0.0.0.0:5000:5000`，绕过了我们"仅本机绑定"的约定。
+
+**deploy.py 已自动处理**：在 git clone 后会读项目自带的 `docker-compose.yml`，提取 service 名 + 实际端口，并生成一份 `docker-compose.override.yml`：
+
+```yaml
+services:
+  <service>:
+    ports: !override
+      - "127.0.0.1:<port>:<port>"
+```
+
+`docker compose` 会自动 merge override + base，`!override` tag 让 ports 字段是替换而不是追加。
+
+注意：你执行 `--port 5000` 时给的是**项目实际监听端口**，不是 axioner-deploy 自己分配的端口。如果项目内部硬编码了端口（比如 entrypoint 里写死 `--url http://127.0.0.1:5000`），preflight 自动选的端口（默认 3102+）没用，还是要手动 `--port` 跟项目对齐。
+
+### 2. Cloudflare 代理（橙云）下 DNS 解析
+
+如果你的域名挂在 Cloudflare 且开了代理，子域名 A 记录会解析到 Cloudflare 的 anycast IP（`104.16.*` / `172.64.*` 等），而不是源站 `38.12.23.241`。
+
+**preflight 已识别**：内置 Cloudflare 公开的 IPv4 ranges 列表。命中时报告里会显示 `⚠ Cloudflare 代理 <IP>`（黄色 warn，不阻塞 deploy）。Certbot 用 HTTP-01 challenge 通常能透过代理拿证书；万一不行，临时把 Cloudflare 后台那条 A 记录的代理状态改成"灰云"（仅 DNS）→ 跑完 certbot 拿到证书 → 改回橙云。
+
+### 3. 上游 Dockerfile 与 requirements 不兼容
+
+实测 `Suxiaoqinx/Netease_url` 的 Dockerfile 用 `python:3.9.22-alpine3.21`，但 `requirements.txt` 里 `click==8.2.1` 等需要 Python ≥ 3.10。docker build 会失败：
+
+```text
+ERROR: Could not find a version that satisfies the requirement click==8.2.1
+```
+
+**解决**：fork 上游仓库，改 Dockerfile 第一行为 `FROM python:3.10-alpine`，从你 fork 的 repo 部署。这样以后 git pull 不会冲突。如果对 fork 不放心改坏，也可以在服务器 `/opt/<name>/` 加一份 `Dockerfile.local` + 在 override 里指向它，但维护比 fork 麻烦。
+
+### 4. 项目把 cookie/secrets 直接 commit 进 git
+
+`Suxiaoqinx/Netease_url` 的仓库里就有一份 `cookie.txt`（上游作者的 sample，早已失效）。所以 fork 之后服务器上拿到的也是这个 sample。
+
+**两件事要做**：
+- **挂卷而非 build-in**：在 `docker-compose.override.yml` 里加 `volumes: - ./cookie.txt:/app/cookie.txt:ro`，让宿主机 cookie 优先于镜像里的。否则 `docker compose restart` 不重 build，永远用旧的。
+- **不要把真实 cookie 推回 fork**：直接在服务器 `vim /opt/<name>/cookie.txt`，或本地 paramiko `write_file` 进去。fork 里那个 sample 不删除也无所谓（它本来就失效）。
+
+### 5. 健康检查端点的 valid/invalid 不一定阻塞功能
+
+`Netease_url` 的 `/health` 显示 `cookie_status: invalid`，但实际 API 调用（搜索、URL 解析、lossless）能正常工作。它的 `is_cookie_valid()` 要求六个字段全有（`MUSIC_U` `MUSIC_A` `__csrf` 等），但**实际网易云接口只校验 `MUSIC_U`**。所以 health 报 invalid 不代表必须修，要看真实 API 是否能返回数据。
+
 ## 设计 + 实施
 
 - 设计文档：[`docs/superpowers/specs/2026-05-04-remote-ai-deploy-design.md`](docs/superpowers/specs/2026-05-04-remote-ai-deploy-design.md)
 - 实施计划：[`docs/superpowers/plans/2026-05-04-remote-ai-deploy-implementation.md`](docs/superpowers/plans/2026-05-04-remote-ai-deploy-implementation.md)
+- **运行现状**：[`docs/deployments.md`](docs/deployments.md)（已部署项目清单 / 端口分配 / 服务器变更历史）
 
 ## 安全模型
 
