@@ -6,6 +6,8 @@ runtime when they fail.
 
 from __future__ import annotations
 
+import ipaddress
+
 from .plan_io import Conflict, DeployPlan, SERVER_IP
 from .server_state import ServerState
 
@@ -13,6 +15,31 @@ from .server_state import ServerState
 # Thresholds (centralized so they're easy to tune)
 MEM_WARN_MB = 200          # warn if available memory < this
 DISK_BLOCK_GB = 1          # block if available disk < this
+
+
+# Cloudflare published IPv4 ranges (https://www.cloudflare.com/ips-v4/).
+# Used to recognize when a subdomain is behind Cloudflare's proxy
+# (orange-cloud) — the resolved IP won't match our origin, but
+# certbot/HTTP still tunnel through if Cloudflare's DNS points at us.
+# We treat these as `warn` instead of `block`.
+_CLOUDFLARE_V4_RANGES = (
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22",
+    "103.31.4.0/22",   "141.101.64.0/18", "108.162.192.0/18",
+    "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22",
+    "198.41.128.0/17", "162.158.0.0/15",  "104.16.0.0/13",
+    "104.24.0.0/14",   "172.64.0.0/13",   "131.0.72.0/22",
+)
+_CLOUDFLARE_NETWORKS = tuple(
+    ipaddress.ip_network(r) for r in _CLOUDFLARE_V4_RANGES
+)
+
+
+def _is_cloudflare_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _CLOUDFLARE_NETWORKS)
 
 
 def detect(
@@ -29,6 +56,10 @@ def detect(
     conflicts: list[Conflict] = []
 
     # --- DNS ---
+    # Three buckets:
+    #   (a) resolves to expected origin IP   -> no conflict
+    #   (b) resolves to Cloudflare proxy IP  -> warn (proxied; certbot still works)
+    #   (c) unresolved or wrong elsewhere    -> block
     if dns_resolves_to is None:
         conflicts.append(Conflict(
             kind="dns", severity="block",
@@ -37,7 +68,22 @@ def detect(
                 f"在 DNS 后台为 {plan.subdomain} 添加 A 记录指向 {expected_server_ip}"
             ),
         ))
-    elif dns_resolves_to != expected_server_ip:
+    elif dns_resolves_to == expected_server_ip:
+        pass  # ok
+    elif _is_cloudflare_ip(dns_resolves_to):
+        conflicts.append(Conflict(
+            kind="dns", severity="warn",
+            message=(
+                f"{plan.subdomain} 解析到 Cloudflare 代理 IP {dns_resolves_to}"
+                f"（非源站 {expected_server_ip}）"
+            ),
+            suggested_action=(
+                "确认 Cloudflare 后台 A 记录指向 38.12.23.241。"
+                "若 certbot 失败，可临时关闭橙云代理（变灰云）后重试，"
+                "拿到证书后再开回。"
+            ),
+        ))
+    else:
         conflicts.append(Conflict(
             kind="dns", severity="block",
             message=f"{plan.subdomain} 解析到 {dns_resolves_to}，应为 {expected_server_ip}",

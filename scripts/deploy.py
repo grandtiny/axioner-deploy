@@ -100,6 +100,149 @@ def step_git_clone(ssh: SSHClient, plan: DeployPlan) -> str:
     return f"cloned {plan.repo_url}"
 
 
+def step_inspect_compose(ssh: SSHClient, plan: DeployPlan) -> tuple[str, dict]:
+    """Inspect the project's own docker-compose.yml and extract:
+      - service name (the first service if multiple)
+      - host port (the published port the service expects)
+      - container port (the target port inside the container)
+
+    Returns (note, info_dict) where info_dict contains:
+      'service', 'host_port', 'container_port', 'changed_port'
+
+    The plan.port may be UPDATED in-place if it disagrees with what
+    the project's compose declares — projects often hardcode their
+    port in source, so we follow the project rather than fight it.
+    """
+    # Read the compose file via SSH (server has python3 + yaml).
+    # We send the YAML path and let server-side python emit JSON we parse.
+    compose_paths = ["docker-compose.yml", "docker-compose.yaml",
+                     "compose.yml", "compose.yaml"]
+    found_path = None
+    for p in compose_paths:
+        rc, out, _ = ssh.run(
+            f"test -f {_q(plan.target_dir)}/{_q(p)} && echo FOUND || echo MISSING"
+        )
+        if "FOUND" in out:
+            found_path = p
+            break
+    if not found_path:
+        raise DeployStepError("inspect_compose", 1,
+                              "no docker-compose.yml in repo", "")
+
+    # Parse server-side. Output is a single JSON line we can json.loads.
+    parse_script = (
+        "import yaml, json, sys; "
+        "d = yaml.safe_load(open(sys.argv[1])); "
+        "svcs = d.get('services') or {}; "
+        "name = next(iter(svcs), None); "
+        "spec = svcs.get(name) or {} if name else {}; "
+        "print(json.dumps({'service': name, 'ports': spec.get('ports') or []}))"
+    )
+    cmd = (f"cd {_q(plan.target_dir)} && "
+           f"python3 -c {_q(parse_script)} {_q(found_path)}")
+    rc, out, err = ssh.run(cmd, timeout=15)
+    if rc != 0:
+        raise DeployStepError("inspect_compose", rc, out, err)
+
+    import json as _json
+    try:
+        info = _json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise DeployStepError("inspect_compose", 1,
+                              f"could not parse compose output: {out!r}", err)
+
+    service = info.get("service")
+    if not service:
+        raise DeployStepError("inspect_compose", 1,
+                              "compose has no services", "")
+
+    # Extract host & container port from the first port spec.
+    # Port specs can be:
+    #   "5000:5000"           -> host=5000, container=5000
+    #   "127.0.0.1:5000:5000" -> host=5000, container=5000
+    #   "5000"                -> host=auto, container=5000 (rare)
+    #   {target: 5000, published: 5000, ...}  long form
+    ports = info.get("ports") or []
+    host_port = None
+    container_port = None
+    if ports:
+        spec = ports[0]
+        if isinstance(spec, str):
+            parts = spec.split(":")
+            if len(parts) == 1:
+                container_port = int(parts[0])
+            elif len(parts) == 2:
+                host_port = int(parts[0]); container_port = int(parts[1])
+            elif len(parts) == 3:
+                host_port = int(parts[1]); container_port = int(parts[2])
+        elif isinstance(spec, dict):
+            t = spec.get("target") or spec.get("container_port")
+            p = spec.get("published") or spec.get("host_port")
+            if t: container_port = int(t)
+            if p: host_port = int(p)
+
+    if container_port is None:
+        raise DeployStepError("inspect_compose", 1,
+                              f"could not parse port from {ports!r}", "")
+
+    # If host_port wasn't explicit, fall back to container_port (the
+    # common case — project says "5000:5000").
+    if host_port is None:
+        host_port = container_port
+
+    # If the project's host_port disagrees with the auto-picked plan.port,
+    # follow the project. Tell the user.
+    changed = host_port != plan.port
+    old_port = plan.port
+    plan.port = host_port
+
+    info_out = {
+        "service": service,
+        "host_port": host_port,
+        "container_port": container_port,
+        "changed_port": changed,
+        "old_port": old_port,
+    }
+    if changed:
+        note = (f"service={service}, port {old_port} → {host_port} "
+                f"(项目 compose 硬编码)")
+    else:
+        note = f"service={service}, port={host_port}"
+    return note, info_out
+
+
+def step_write_override(ssh: SSHClient, plan: DeployPlan,
+                        compose_info: dict) -> str:
+    """Write a docker-compose.override.yml that forces the host port
+    to bind only to 127.0.0.1 (defense in depth: cloud firewall already
+    limits ports, but the spec mandates localhost-only binding)."""
+    service = compose_info["service"]
+    host = compose_info["host_port"]
+    cont = compose_info["container_port"]
+
+    # Use compose v2's `!override` tag so our ports REPLACE the base
+    # spec rather than appending. Available in compose v2.20+.
+    override = (
+        "services:\n"
+        f"  {service}:\n"
+        "    ports: !override\n"
+        f"      - \"127.0.0.1:{host}:{cont}\"\n"
+    )
+    override_path = f"{plan.target_dir}/docker-compose.override.yml"
+    ssh.write_file(override, override_path, mode=0o644)
+
+    # Verify the merged config is what we expect.
+    rc, out, err = ssh.run(
+        f"cd {_q(plan.target_dir)} && docker compose config 2>&1 "
+        f"| grep -E 'host_ip|published' | head -4"
+    )
+    if "127.0.0.1" not in out:
+        raise DeployStepError("write_override", 1,
+                              f"merged config missing 127.0.0.1 binding: {out}",
+                              err)
+    return f"override written, host_ip=127.0.0.1:{host}"
+
+
 def step_prepare_env(ssh: SSHClient, plan: DeployPlan,
                      interactive: bool) -> str:
     """Ensure .env exists. If it doesn't, copy .env.example. Detect
@@ -295,9 +438,9 @@ def main(argv: list[str] | None = None) -> int:
     print()
 
     if args.dry_run:
-        print(_c(_YELLOW, "[dry-run] 8 个步骤：mkdir / git clone / prepare .env / "
-                          "docker compose / write nginx / nginx -t reload / "
-                          "certbot / health check"))
+        print(_c(_YELLOW, "[dry-run] 10 个步骤：mkdir / git clone / inspect compose / "
+                          "write override / prepare .env / docker compose / "
+                          "write nginx / nginx -t reload / certbot / health check"))
         return 0
 
     if not args.yes and not plan.confirmed_by_user:
@@ -306,27 +449,39 @@ def main(argv: list[str] | None = None) -> int:
             print("已取消")
             return 0
 
-    # Execute
-    steps = [
-        ("mkdir target dir",   lambda s, p: step_mkdir_target(s, p)),
-        ("git clone",          lambda s, p: step_git_clone(s, p)),
-        ("prepare .env",       lambda s, p: step_prepare_env(s, p, not args.yes)),
-        ("docker compose up",  lambda s, p: step_docker_up(s, p)),
-        ("write nginx config", lambda s, p: step_write_nginx(s, p, Path(args.templates_dir))),
-        ("nginx -t + reload",  lambda s, p: step_nginx_test_reload(s, p)),
-        ("certbot HTTPS",      lambda s, p: step_certbot(s, p, args.cert_email)),
-        ("health check",       lambda s, p: step_health_check(s, p)),
-    ]
-
-    results: list[StepResult] = []
+    # Execute. Some steps need to pass data forward (compose_info), so
+    # keep this as an explicit sequence rather than a list of lambdas.
     print()
     print(_c(_BOLD, "═══ 执行中 ═══"))
 
+    results: list[StepResult] = []
+    compose_info: dict | None = None
+
     with SSHClient(args.alias) as ssh:
-        for idx, (name, fn) in enumerate(steps, 1):
-            print(_fmt_step_header(idx, len(steps), name))
+        sequence = [
+            ("mkdir target dir",   lambda: step_mkdir_target(ssh, plan)),
+            ("git clone",          lambda: step_git_clone(ssh, plan)),
+            ("inspect compose",    lambda: step_inspect_compose(ssh, plan)),
+            ("write compose override", lambda: step_write_override(ssh, plan, compose_info)),
+            ("prepare .env",       lambda: step_prepare_env(ssh, plan, not args.yes)),
+            ("docker compose up",  lambda: step_docker_up(ssh, plan)),
+            ("write nginx config", lambda: step_write_nginx(ssh, plan, Path(args.templates_dir))),
+            ("nginx -t + reload",  lambda: step_nginx_test_reload(ssh, plan)),
+            ("certbot HTTPS",      lambda: step_certbot(ssh, plan, args.cert_email)),
+            ("health check",       lambda: step_health_check(ssh, plan)),
+        ]
+
+        for idx, (name, fn) in enumerate(sequence, 1):
+            print(_fmt_step_header(idx, len(sequence), name))
             try:
-                note = fn(ssh, plan)
+                if name == "inspect compose":
+                    note, compose_info = fn()
+                elif name == "write compose override":
+                    if compose_info is None:
+                        raise DeployStepError("write_override", 1, "compose_info missing", "")
+                    note = fn()
+                else:
+                    note = fn()
                 print(f"     {_c(_GREEN, 'OK')} {note}")
                 results.append(StepResult(name, True, note))
             except DeployStepError as e:
@@ -341,7 +496,7 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"     {line}")
                 results.append(StepResult(name, False, str(e)))
                 print()
-                print(_c(_RED, f"部署中止于步骤 [{idx}/{len(steps)}] {name}"))
+                print(_c(_RED, f"部署中止于步骤 [{idx}/{len(sequence)}] {name}"))
                 print(_c(_YELLOW, f"已完成步骤可通过 ssh axioner 检查；"
                                   "未完成步骤未执行。"))
                 return 1
